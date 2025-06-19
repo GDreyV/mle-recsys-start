@@ -166,3 +166,4 @@ cython_debug/
 *.par
 *.parquet
 *.pickle
+*.pkl
