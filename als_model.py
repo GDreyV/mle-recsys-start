@@ -167,6 +167,38 @@ class ALSPredictor:
 
         return recommendations
 
+    def recommend_by_item(self, item_id: int) -> pd.DataFrame:
+        assert self._item_encoder is not None, "Item encoder is not initialized."
+        assert self._model is not None, "Model is not initialized. Call fit() first."
+        item_id_enc = self._item_encoder.transform([item_id])[0]
+        similar_items = self._model.similar_items(item_id_enc)
+        similar_items_df = pd.DataFrame(
+            zip(*similar_items), columns=["item_id_enc", "score"]
+        )
+        similar_items_df["item_id"] = self._item_encoder.inverse_transform(
+            similar_items_df["item_id_enc"]
+        )
+        return similar_items_df[["item_id", "score"]]
+
+    def recommend_u2u(self, user_id: int, n: int = 5) -> pd.DataFrame:
+        """
+        Возвращает рекомендации по похожим пользователям для заданного пользователя.
+        """
+        assert self._user_encoder is not None, "User encoder is not initialized."
+        assert self._model is not None, "Model is not initialized. Call fit() first."
+
+        user_id_enc = self._user_encoder.transform([user_id])[0]
+        similar_users = self._model.similar_users(user_id_enc, N=n)
+
+        similar_users_df = pd.DataFrame(
+            zip(*similar_users), columns=["user_id_enc", "score"]
+        )
+        similar_users_df["user_id"] = self._user_encoder.inverse_transform(
+            similar_users_df["user_id_enc"]
+        )
+
+        return similar_users_df[["user_id", "score"]]
+
     def _predict_all(self) -> pd.DataFrame:
         assert self._model is not None, "Model is not initialized. Call fit() first."
 
