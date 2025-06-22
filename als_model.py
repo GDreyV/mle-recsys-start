@@ -3,7 +3,6 @@ import implicit.gpu.als
 from implicit.als import AlternatingLeastSquares
 import pandas as pd
 import scipy
-import sklearn.preprocessing
 import numpy as np
 import sys
 import os
@@ -11,6 +10,7 @@ import joblib
 from typing import TypeAlias, cast
 import time
 import sklearn.metrics
+from data_encoder import DataEncoder
 
 ALSModel: TypeAlias = (
     implicit.gpu.als.AlternatingLeastSquares | implicit.cpu.als.AlternatingLeastSquares
@@ -26,86 +26,46 @@ _RECOMMENDATIONS_PATH = os.path.abspath(
 class ALSPredictor:
     _als_recommendations: pd.DataFrame | None = None
 
-    def __init__(
-        self,
-        items: pd.DataFrame,
-        events: pd.DataFrame,
-        events_train: pd.DataFrame,
-        events_test: pd.DataFrame,
-    ):
-        self._items = items
-        self._events = events
-        self._events_train = events_train
-        self._events_test = events_test
-        self._encode_data()
+    def __init__(self, data_encoder: DataEncoder):
         self._model = None
+        self._encoder = data_encoder
 
     def fit(self) -> int:
         """
         Инициализация модели ALS.
         """
-        self._encode_data()
-
-        if self._model is None:
-            self._model = self._train_or_load()
-
-        return self._events_train["item_id_enc"].max()
-
-    def _encode_data(self) -> None:
-        start = time.time()
-        print("Encoding data...")
-        self._encode_user()
-        print(f"User encoding took {time.time() - start:.2f} seconds")
-
-        start = time.time()
-        self._encode_item()
-        print(f"Item encoding took {time.time() - start:.2f} seconds")
-
         start = time.time()
         self._construct_user_item_matrix()
         print(f"User-item matrix construction took {time.time() - start:.2f} seconds")
 
-    def _encode_user(self) -> None:
-        # перекодируем идентификаторы пользователей:
-        # из имеющихся в последовательность 0, 1, 2, ...
-        self._user_encoder = sklearn.preprocessing.LabelEncoder()
-        self._user_encoder.fit(self._events["user_id"])
-        self._events_train["user_id_enc"] = self._user_encoder.transform(
-            self._events_train["user_id"]
-        )
-        self._events_test["user_id_enc"] = self._user_encoder.transform(
-            self._events_test["user_id"]
-        )
+        if self._model is None:
+            self._model = self._train_or_load()
 
-    def _encode_item(self) -> None:
-        # перекодируем идентификаторы объектов:
-        # из имеющихся в последовательность 0, 1, 2, ...
-        self._item_encoder = sklearn.preprocessing.LabelEncoder()
-        self._item_encoder.fit(self._items["item_id"])
-        self._items["item_id_enc"] = self._item_encoder.transform(
-            self._items["item_id"]
+        return self._encoder.train["item_id_enc"].max()
+
+    def get_train_size(self) -> float:
+        matrix_size = (
+            sum([sys.getsizeof(i) for i in self._user_item_matrix_train.data]) / 1024**3
         )
-        self._events_train["item_id_enc"] = self._item_encoder.transform(
-            self._events_train["item_id"]
-        )
-        self._events_test["item_id_enc"] = self._item_encoder.transform(
-            self._events_test["item_id"]
-        )
+        return matrix_size
 
     def _construct_user_item_matrix(self) -> None:
         # создаём sparse-матрицу формата CSR
         self._user_item_matrix = scipy.sparse.csr_matrix(
             (
-                self._events_test["rating"],
-                (self._events_test["user_id_enc"], self._events_test["item_id_enc"]),
+                self._encoder.test["rating"],
+                (self._encoder.test["user_id_enc"], self._encoder.test["item_id_enc"]),
             ),
             dtype=np.int8,
         )
 
         self._user_item_matrix_train = scipy.sparse.csr_matrix(
             (
-                self._events_train["rating"],
-                (self._events_train["user_id_enc"], self._events_train["item_id_enc"]),
+                self._encoder.train["rating"],
+                (
+                    self._encoder.train["user_id_enc"],
+                    self._encoder.train["item_id_enc"],
+                ),
             ),
             dtype=np.int8,
         )
@@ -124,18 +84,6 @@ class ALSPredictor:
         return als_model
 
     def _train(self) -> ALSModel:
-        events_train = self._events_train
-        matrix_size = (
-            (events_train["user_id_enc"].max() + 1)
-            * (events_train["item_id_enc"].max() + 1)
-            / 1024**3
-        )  # in GB
-        print(f"Expected matrix size is {matrix_size:.2f} GB")
-
-        matrix_size = (
-            sum([sys.getsizeof(i) for i in self._user_item_matrix_train.data]) / 1024**3
-        )
-        print(f"Real matrix size {matrix_size:.2f} GB")
 
         als_model: ALSModel = AlternatingLeastSquares(
             factors=50, iterations=50, regularization=0.05, random_state=0
@@ -148,10 +96,14 @@ class ALSPredictor:
         Возвращает отранжированные рекомендации для заданного пользователя
         """
         assert self._model is not None, "Model is not initialized. Call init() first."
-        assert self._user_encoder is not None, "User encoder is not initialized."
-        assert self._item_encoder is not None, "Item encoder is not initialized."
+        assert (
+            self._encoder.user_encoder is not None
+        ), "User encoder is not initialized."
+        assert (
+            self._encoder.item_encoder is not None
+        ), "Item encoder is not initialized."
 
-        user_id_enc = self._user_encoder.transform([user_id])[0]
+        user_id_enc = self._encoder.user_encoder.transform([user_id])[0]
         recommendations = self._model.recommend(
             user_id_enc,
             self._user_item_matrix[user_id_enc],
@@ -161,21 +113,23 @@ class ALSPredictor:
         recommendations = pd.DataFrame(
             {"item_id_enc": recommendations[0], "score": recommendations[1]}
         )
-        recommendations["item_id"] = self._item_encoder.inverse_transform(
+        recommendations["item_id"] = self._encoder.item_encoder.inverse_transform(
             recommendations["item_id_enc"]
         )
 
         return recommendations
 
     def recommend_by_item(self, item_id: int) -> pd.DataFrame:
-        assert self._item_encoder is not None, "Item encoder is not initialized."
+        assert (
+            self._encoder.item_encoder is not None
+        ), "Item encoder is not initialized."
         assert self._model is not None, "Model is not initialized. Call fit() first."
-        item_id_enc = self._item_encoder.transform([item_id])[0]
+        item_id_enc = self._encoder.item_encoder.transform([item_id])[0]
         similar_items = self._model.similar_items(item_id_enc)
         similar_items_df = pd.DataFrame(
             zip(*similar_items), columns=["item_id_enc", "score"]
         )
-        similar_items_df["item_id"] = self._item_encoder.inverse_transform(
+        similar_items_df["item_id"] = self._encoder.item_encoder.inverse_transform(
             similar_items_df["item_id_enc"]
         )
         return similar_items_df[["item_id", "score"]]
@@ -184,16 +138,18 @@ class ALSPredictor:
         """
         Возвращает рекомендации по похожим пользователям для заданного пользователя.
         """
-        assert self._user_encoder is not None, "User encoder is not initialized."
+        assert (
+            self._encoder.user_encoder is not None
+        ), "User encoder is not initialized."
         assert self._model is not None, "Model is not initialized. Call fit() first."
 
-        user_id_enc = self._user_encoder.transform([user_id])[0]
+        user_id_enc = self._encoder.user_encoder.transform([user_id])[0]
         similar_users = self._model.similar_users(user_id_enc, N=n)
 
         similar_users_df = pd.DataFrame(
             zip(*similar_users), columns=["user_id_enc", "score"]
         )
-        similar_users_df["user_id"] = self._user_encoder.inverse_transform(
+        similar_users_df["user_id"] = self._encoder.user_encoder.inverse_transform(
             similar_users_df["user_id_enc"]
         )
 
@@ -203,7 +159,7 @@ class ALSPredictor:
         assert self._model is not None, "Model is not initialized. Call fit() first."
 
         # получаем список всех возможных user_id (перекодированных)
-        user_ids_encoded = range(len(self._user_encoder.classes_))
+        user_ids_encoded = range(len(self._encoder.user_encoder.classes_))
 
         # получаем рекомендации для всех пользователей
         als_recommendations = self._model.recommend(
@@ -235,10 +191,10 @@ class ALSPredictor:
         als_recommendations["score"] = als_recommendations["score"].astype("float")
 
         # получаем изначальные идентификаторы
-        als_recommendations["user_id"] = self._user_encoder.inverse_transform(
+        als_recommendations["user_id"] = self._encoder.user_encoder.inverse_transform(
             als_recommendations["user_id_enc"]
         )
-        als_recommendations["item_id"] = self._item_encoder.inverse_transform(
+        als_recommendations["item_id"] = self._encoder.item_encoder.inverse_transform(
             als_recommendations["item_id_enc"]
         )
         als_recommendations = als_recommendations.drop(
@@ -292,7 +248,7 @@ class ALSPredictor:
         """
         als_recommendations = self.get_all_recommendations()
         als_recommendations = als_recommendations.merge(
-            self._events_test[["user_id", "item_id", "rating"]].rename(
+            self._encoder.test[["user_id", "item_id", "rating"]].rename(
                 columns={"rating": "rating_test"}
             ),
             on=["user_id", "item_id"],
@@ -309,7 +265,7 @@ class ALSPredictor:
         # Number of users with at least one rating_test value (i.e., NDCG was computed)
         users_with_ndcg = als_recommendations.loc[rating_test_idx, "user_id"].nunique()
         # Total number of users in the test set
-        total_test_users = self._events_test["user_id"].nunique()
+        total_test_users = self._encoder.test["user_id"].nunique()
         # Compute percentage
         percentage_covered = 100 * users_with_ndcg / total_test_users
 
