@@ -30,6 +30,13 @@ class ALSPredictor:
         self._model = None
         self._encoder = data_encoder
 
+    @property
+    def model(self) -> ALSModel | None:
+        """
+        Возвращает текущую модель ALS.
+        """
+        return self._model
+
     def fit(self) -> int:
         """
         Инициализация модели ALS.
